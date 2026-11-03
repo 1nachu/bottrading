@@ -55,12 +55,14 @@ Se requieren las **tres condiciones simultáneas**.
 **Long**
 - Precio **>** EMA 200
 - ADX **>** 20
-- Precio **≥** máximo Donchian 20 (últimas 20 velas de 4H)
+- Cierre de la vela **≥** máximo Donchian 20 (máximo de las 20 velas de 4H **anteriores**, sin incluir la actual)
 
 **Short**
 - Precio **<** EMA 200
 - ADX **>** 20
-- Precio **≤** mínimo Donchian 20
+- Cierre de la vela **≤** mínimo Donchian 20 (mínimo de las 20 velas anteriores)
+
+**Velas cerradas:** las señales (EMA, ADX, Donchian, ATR) se calculan solo con velas **cerradas**; la vela en curso se descarta. La entrada se evalúa **una sola vez por vela cerrada** y se ejecuta a mercado, lo que además evita reentrar en la misma vela después de que salte el stop.
 
 **Salida adicional:** el bot cierra la posición a mercado si deja de cumplirse la condición de entrada (el precio cruza la EMA 200 en contra, o el ADX cae por debajo de 20).
 
@@ -80,10 +82,14 @@ Ejemplo: capital $1,000 · ATR $500 → distancia $1,200 · riesgo $20 → tama�
 
 A mayor volatilidad, menor tamaño: el riesgo absoluto se mantiene constante.
 
+Además, el tamaño se limita al nocional máximo permitido por el apalancamiento (`equity × LEVERAGE × 0.95`), se redondea a la precisión del exchange y no se opera si queda por debajo de los mínimos de Binance (cantidad y nocional mínimo).
+
 ### Trailing stop
 
 - **Long:** stop inicial `entrada − ATR×2.4`; en cada ciclo `stop = max(stop_anterior, precio − distancia)` (solo sube).
 - **Short:** stop inicial `entrada + ATR×2.4`; en cada ciclo `stop = min(stop_anterior, precio + distancia)` (solo baja).
+
+El trailing usa el **precio en tiempo real** y solo se actualiza en el exchange cuando el nivel mejora. El stop nuevo se coloca **antes** de cancelar el anterior, así la posición nunca queda sin stop.
 
 Ejemplo Long (entrada $65,000 · ATR $800 · distancia $1,920):
 
@@ -104,32 +110,36 @@ El bot se compone de módulos independientes que corren en un loop continuo:
 | Módulo | Función |
 | --- | --- |
 | Conexión (`ccxt`) | Comunicación con Binance Futures: datos, órdenes, balance y posiciones |
-| Datos de mercado | Descarga las últimas 250 velas de 4H y las carga en un DataFrame de `pandas` |
+| Datos de mercado | Descarga las últimas 1000 velas de 4H, descarta la vela en curso y las carga en un DataFrame de `pandas` |
 | Indicadores | EMA 200, ADX/DI+/DI−, Donchian 20 y ATR 14 (replicando Pine Script) |
 | Evaluación de señal | Devuelve `long`, `short` o ninguna señal |
 | Position sizing | Calcula el tamaño según capital, riesgo y distancia al stop |
-| Gestión de órdenes | Abre/cierra posiciones y coloca/actualiza el stop loss |
-| Trailing stop | Actualiza el stop a favor de la posición en cada ciclo |
+| Gestión de órdenes | Abre/cierra posiciones y coloca/actualiza el stop loss; si el stop no se puede colocar, cierra la posición |
+| Trailing stop | Actualiza el stop a favor de la posición; tras un reinicio recupera el estado desde el exchange |
 | Loop principal | Ejecuta el ciclo cada 60 s y gestiona errores |
 
 ### Flujo de ejecución
 
 ```mermaid
 flowchart TD
-    A[Descargar 250 velas 4H] --> B[Calcular indicadores]
+    A[Descargar velas 4H y descartar la vela en curso] --> B[Calcular indicadores]
     B --> C[Consultar equity y posición]
     C --> D{¿Posición abierta?}
-    D -- No --> E{¿Señal long/short?}
+    D -- No --> E{¿Vela nueva + señal + ruptura?}
     E -- Sí --> F[Abrir posición + stop inicial]
     E -- No --> H
     D -- Sí --> G{¿Condición vigente?}
-    G -- Sí --> G1[Actualizar trailing stop]
+    G -- Sí --> G1[Actualizar trailing stop si mejora]
     G -- No --> G2[Cerrar a mercado]
     F --> H[Registrar en log]
     G1 --> H
     G2 --> H
     H --> I[Esperar 60 s] --> A
 ```
+
+### Reinicios
+
+Si el bot se reinicia con una posición abierta, recupera el stop existente desde Binance (o coloca uno nuevo si no hay) y continúa con el trailing.
 
 ### Manejo de errores
 
@@ -139,7 +149,7 @@ flowchart TD
 | `ExchangeError` | Espera 60 s y reintenta |
 | Error inesperado | Lo registra en el log y espera 60 s |
 
-El bot **nunca se detiene** por un error temporal.
+El bot **nunca se detiene** por un error temporal. Si no puede leer el balance o la posición, **salta el ciclo** (nunca asume que no hay posición abierta).
 
 ---
 
@@ -150,7 +160,7 @@ El bot **nunca se detiene** por un error temporal.
 - Python **3.9+**
 - Cuenta de Binance con el mercado de **Futuros USDⓈ-M** activado
 - API Key con permiso de **Futures Trading** (⚠️ nunca habilitar retiros)
-- Capital recomendado: mínimo **200 USDT** en la cuenta de futuros para que el position sizing funcione correctamente
+- Capital recomendado: mínimo **200 USDT** en la cuenta de futuros. Binance exige un nocional mínimo por orden (≈100 USDT en BTC/USDT); si el tamaño calculado queda por debajo, el bot no opera y lo avisa en el log
 
 ### Dependencias
 
@@ -168,17 +178,24 @@ Los parámetros están al inicio de `trading_bot.py` y se pueden editar sin toca
 
 | Parámetro | Default | Descripción |
 | --- | --- | --- |
-| Temporalidad | `"4h"` | Debe coincidir con TradingView |
-| Apalancamiento | `5` | Apalancamiento en Binance Futures |
-| Riesgo por operación | `0.02` (2%) | Porcentaje del capital en riesgo |
-| Período Donchian | `20` | Períodos del canal Donchian |
+| `SYMBOL` | `"BTC/USDT:USDT"` | Perpetuo USDⓈ-M (símbolo unificado de ccxt para futuros) |
+| `TIMEFRAME` | `"4h"` | Temporalidad — debe coincidir con TradingView |
+| `LEVERAGE` | `5` | Apalancamiento en Binance Futures |
+| `VELAS_HISTORICO` | `1000` | Velas descargadas (la EMA 200 necesita historial para converger) |
+| `RIESGO_POR_TRADE` | `0.02` (2%) | Porcentaje del capital en riesgo por operación |
+| `LONGITUD_RUPTURA` | `20` | Períodos del canal Donchian |
+| `ADX_LONGITUD` | `14` | Períodos del ADX |
 | `ADX_UMBRAL` | `20` | ADX mínimo para una señal válida |
-| Multiplicador ATR | `2.4` | Distancia del stop = ATR × multiplicador |
-| Intervalo del loop | `60` | Frecuencia del ciclo, en segundos |
+| `ATR_LONGITUD` | `14` | Períodos del ATR |
+| `ATR_MULTIPLICADOR` | `2.4` | Distancia del stop = ATR × multiplicador |
+| `EMA_LONGITUD` | `200` | Períodos de la EMA de tendencia |
+| `INTERVALO_SEGUNDOS` | `60` | Frecuencia del loop, en segundos |
 
 ### Credenciales
 
 Preferí **variables de entorno** en lugar de escribir las claves en el código:
+
+El bot lee las claves de variables de entorno y no arranca si faltan:
 
 ```bash
 export BINANCE_API_KEY="tu_api_key"
@@ -204,7 +221,13 @@ En Windows, usá una tarea programada o `pythonw trading_bot.py`. Para detenerlo
 
 ### Testnet (recomendado antes de operar con dinero real)
 
-Agregá `"test": True` en las opciones de `ccxt` para conectarte al entorno simulado de Binance Futures y validar la lógica sin riesgo.
+Activá el modo de pruebas con una variable de entorno (usa `set_sandbox_mode` de ccxt) para validar la lógica con dinero ficticio:
+
+```bash
+export BINANCE_TESTNET=true
+```
+
+El testnet de Binance Futures requiere **claves propias del testnet**, distintas de las de tu cuenta real. Verificá en testnet que se abran las posiciones y los stops antes de operar con capital real, y mantené `ccxt` actualizado (`pip install -U ccxt`), ya que Binance cambia su API de órdenes condicionales con cierta frecuencia.
 
 ---
 
@@ -219,9 +242,9 @@ tail -f bot_trading.log
 Ejemplo:
 
 ```
-2025-03-12 14:00:05 [INFO] BTC: 83,450.00 │ ADX: 31.2 │ EMA200: 79,200.00 │ Señal: long │ Posición: 0.0000 │ Equity: 1,000.00 USDT
-2025-03-12 14:00:06 [INFO] Abriendo LONG │ Tamaño: 0.0172 BTC │ Stop: 81,530.00
-2025-03-12 14:01:05 [INFO] Trailing Stop actualizado a: 81,650.00
+2025-03-12 14:00:05 [INFO] BTC: 83450.00 | ADX: 31.2 | EMA200: 79200.00 | Señal: long | Posición: 0.0000 | Equity: 1000.00 USDT
+2025-03-12 14:00:06 [INFO] Abriendo LONG | Tamaño: 0.0120 BTC | Stop: 81530.00
+2025-03-12 14:01:05 [INFO] Trailing Stop actualizado a: 81650.00
 ```
 
 | Mensaje | Significado |
@@ -231,7 +254,9 @@ Ejemplo:
 | `Abriendo LONG/SHORT` | Se está enviando una orden de entrada |
 | `Trailing Stop actualizado` | El stop se movió a favor de la posición |
 | `Condición desactivada` | La condición de entrada ya no se cumple; cierre próximo |
-| `Error de red / Error exchange` | Problema temporal; reintento automático |
+| `Error de red / Error del exchange` | Problema temporal; reintento automático |
+| `Posición ... sin stop — colocando uno nuevo` | Tras un reinicio, el bot encontró una posición sin stop y colocó uno |
+| `cerrando la posición por seguridad` | No se pudo colocar el stop inicial, así que se cerró la posición |
 
 ---
 
@@ -240,7 +265,7 @@ Ejemplo:
 - **Nunca** compartas tu API Secret.
 - **Nunca** habilites permisos de **retiro** en la API key del bot.
 - Restringí la API key por **IP** en Binance.
-- **No subas claves reales a GitHub.** Usá variables de entorno o un archivo `.env` incluido en `.gitignore`.
+- **No subas claves reales a GitHub.** El código las lee de variables de entorno; si usás un archivo `.env`, agregalo a `.gitignore` (junto con `bot_trading.log`).
 
 ---
 
@@ -252,7 +277,7 @@ Ejemplo:
 
 ### Diferencias posibles frente a TradingView
 
-- El bot usa el cierre confirmado de la vela; TradingView puede usar el precio en tiempo real.
+- El bot decide con velas cerradas y entra a mercado cuando detecta la vela nueva, por lo que el precio de entrada puede diferir del cierre simulado en TradingView.
 - El slippage real de las órdenes a mercado difiere del simulado en TradingView (3 pips en el Pine Script).
 - El bot contempla las comisiones reales de Binance Futures (~0.04% maker / 0.06% taker).
 
@@ -275,4 +300,3 @@ Ejemplo:
 ## 📄 Licencia
 
 Este proyecto está bajo la licencia [MIT](LICENSE).
-
