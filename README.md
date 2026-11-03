@@ -274,4 +274,5 @@ Ejemplo:
 
 ## 📄 Licencia
 
-Agregá aquí la licencia que prefieras (por ejemplo MIT).
+Este proyecto está bajo la licencia [MIT](LICENSE).
+
